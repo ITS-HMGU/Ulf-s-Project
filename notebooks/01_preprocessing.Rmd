@@ -1,0 +1,241 @@
+---
+title: "01_preprocessing"
+author: "Martin Proks"
+date: '`r Sys.Date()`'
+knit: (function(inputFile, encoding) { 
+      rmarkdown::render(inputFile,
+                        encoding=encoding,
+                        output_format='all',
+                        output_dir='../reports/')})
+output:
+  # To create PDF report, uncomment below
+  #pdf_document:
+  #  toc: yes
+  html_document:
+    number_sections: yes
+    theme: yeti
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    dev: png
+---
+
+```{r knitr, include = FALSE}
+DOCNAME = knitr::current_input()
+knitr::opts_chunk$set(autodep        = TRUE,
+                      cache          = FALSE,
+                      cache.path     = paste0("cache/", DOCNAME, "/"),
+                      cache.comments = TRUE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.path       = paste0("../reports/figures/", DOCNAME, "/"),
+                      fig.width      = 10,
+                      fig.height     = 8,
+                      message        = FALSE,
+                      warning        = FALSE)
+```
+
+# Introduction
+
+Basic analysis of scRNA-seq experiment.
+
+- filtering was adjusted
+- HVG: 2,500
+- regressing cell cycle
+- resolution is set to default
+- markers include also gene_id and description
+
+```{r, message=FALSE}
+library(glue)
+library(dplyr)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+source("../scripts/helpers.R")
+
+# multithreading
+library(future)
+plan()
+
+options(future.globals.maxSize = 1000 * 1024^2)
+plan("multiprocess", workers = 10)
+plan()
+```
+
+# Load dataset
+
+```{r message=FALSE}
+rna <- Read10X('../data/processed/200910_A00642_0101_AHTJW3DRXX-5000_cells/outs/filtered_feature_bc_matrix/', gene.column=2)
+colnames(rna) <- stringr::str_replace(colnames(rna), '-[0-9]', '')
+
+glue("Duplicated cell tags: {sum(duplicated(colnames(rna)))}")
+raw_ann <- CreateSeuratObject(rna)
+```
+
+# Quality control
+
+```{r}
+raw_ann[['percent.mito']] <- PercentageFeatureSet(raw_ann, pattern = "^MT-")
+raw_ann[['percent.ribo']] <- PercentageFeatureSet(raw_ann, pattern = "^RP[LS]")
+```
+
+```{r}
+VlnPlot(raw_ann, 
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mito", "percent.ribo"),
+        ncol = 4)
+```
+
+```{r}
+ggplot(raw_ann@meta.data, aes(x=nCount_RNA, y=nFeature_RNA, color=percent.mito)) + 
+  geom_point() + 
+  scale_color_continuous(type = "viridis")
+
+nbins <- 100
+min_cells <- 6000
+max_cells <- 120e3
+min_genes <- 1000
+max_genes <- 11500
+max_mito <- 30
+
+ggplot(raw_ann@meta.data, aes(x=nCount_RNA)) + 
+  geom_histogram(bins = nbins) + 
+  geom_vline(aes(xintercept=min_cells), linetype="dashed", color='red')
+
+ggplot(raw_ann@meta.data, aes(x=nFeature_RNA)) + 
+  geom_histogram(bins = nbins) +
+  geom_vline(aes(xintercept=min_genes), linetype="dashed", color='red')
+
+ggplot(raw_ann@meta.data, aes(x=nCount_RNA, y=nFeature_RNA, color=percent.mito)) + 
+  geom_point() + 
+  scale_color_continuous(type = "viridis") +
+  geom_vline(aes(xintercept=min_cells), linetype="dashed", color='red') +
+  geom_vline(aes(xintercept=max_cells), linetype="dashed", color='red') +
+  geom_hline(aes(yintercept=min_genes), linetype="dashed", color='red') +
+  geom_hline(aes(yintercept=max_genes), linetype="dashed", color='red')
+
+ggplot(raw_ann@meta.data, aes(x=percent.mito)) + 
+  geom_histogram(bins = nbins) + 
+  geom_vline(aes(xintercept=max_mito), linetype="dashed", color='red')
+```
+
+## Filtering
+
+```{r}
+print(paste0("Before filtering: ", dim(raw_ann)[2], " cells ",  dim(raw_ann)[1], " genes"))
+```
+
+```{r}
+adata <- subset(raw_ann, subset = 
+                    nFeature_RNA > min_genes & nFeature_RNA < max_genes & 
+                    nCount_RNA > min_cells & nCount_RNA < max_cells &
+                    percent.mito < max_mito)
+adata@misc$annotation <- get_annotation(raw_ann)
+```
+
+```{r}
+ggplot(adata@meta.data, aes(x=nCount_RNA, y=nFeature_RNA, color=percent.mito)) + 
+  geom_point() + scale_color_continuous(type = "viridis")
+
+VlnPlot(adata, 
+        features = c("nFeature_RNA", "nCount_RNA", "percent.mito", "percent.ribo"),
+        ncol = 4)
+```
+
+```{r}
+adata <- CreateSeuratObject(adata@assays$RNA@counts, min.cells = 3, meta.data = adata@meta.data)
+```
+
+```{r}
+print(paste0("After filtering: ", dim(adata)[2], " cells ",  dim(adata)[1], " genes"))
+```
+
+# Normalization
+
+```{r, fig.height=8}
+adata <- NormalizeData(adata)
+adata <- FindVariableFeatures(adata, nfeatures = 2500)
+
+top10 <- head(VariableFeatures(adata), 10)
+plot1 <- VariableFeaturePlot(adata)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+
+adata <- ScaleData(adata, features = rownames(adata))
+```
+
+# Cell Cycle (CC)
+
+## Visualize CC on PCA
+
+Plot below shows that the cell cycle separates specifically due to its phase. This means we have to regress out CC.
+
+```{r}
+adata <- CellCycleScoring(adata, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes, set.ident = TRUE)
+adata <- RunPCA(adata, features = c(cc.genes$s.genes, cc.genes$g2m.genes))
+DimPlot(adata)
+```
+
+## Regress CC
+
+```{r}
+adata <- ScaleData(adata, vars.to.regress = c("S.Score", "G2M.Score"), features = rownames(adata))
+```
+
+```{r}
+adata <- RunPCA(adata, features = c(cc.genes$s.genes, cc.genes$g2m.genes))
+DimPlot(adata)
+```
+
+# PCA
+
+```{r}
+adata <- RunPCA(adata, features = VariableFeatures(object = adata), seed.use = random_seed)
+DimPlot(adata, reduction = "pca")
+ElbowPlot(adata, ndims = 50)
+```
+
+# Clustering
+
+```{r}
+adata <- FindNeighbors(adata, dims = 1:30)
+adata <- FindClusters(adata, random.seed = random_seed)
+```
+
+# Visualization
+
+```{r}
+adata <- RunUMAP(adata, dims = 1:20, seed.use = random_seed)
+```
+
+## UMAP
+
+```{r}
+DimPlot(adata, reduction = "umap", group.by = 'seurat_clusters')
+DimPlot(adata, reduction = "umap", group.by = 'Phase')
+```
+
+```{r}
+DimPlot(adata, reduction = "umap")
+FeaturePlot(adata, features = 'NEUROG3', reduction = 'umap')
+FeaturePlot(adata, features = 'PDX1', reduction = 'umap')
+```
+
+# Markers
+
+```{r}
+markers <- FindAllMarkers(adata, logfc.threshold = 1, only.pos = TRUE)
+m <- markers %>%
+ group_by(cluster) %>%
+ top_n(n = 50, wt = avg_log2FC)
+m <- cbind(m, adata@misc$annotation[m$gene, c("ensembl_id", "description")])
+write.csv(m, file = '../results/01_markers.csv')
+
+m
+```
+
+## Save RDS
+
+```{r}
+saveRDS(adata, file = '../data/processed/01_adata.RDS')
+```

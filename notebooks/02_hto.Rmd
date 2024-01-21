@@ -1,0 +1,208 @@
+---
+title: "02_HTO"
+author: "Martin Proks"
+date: '`r Sys.Date()`'
+knit: (function(inputFile, encoding) { 
+      rmarkdown::render(inputFile,
+                        encoding=encoding,
+                        output_format='all',
+                        output_dir='../reports/')})
+output:
+  # To create PDF report, uncomment below
+  #pdf_document:
+  #  toc: yes
+  html_document:
+    number_sections: yes
+    theme: yeti
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    dev: png
+---
+
+```{r knitr, include = FALSE}
+DOCNAME = knitr::current_input()
+knitr::opts_chunk$set(autodep        = TRUE,
+                      cache          = FALSE,
+                      cache.path     = paste0("cache/", DOCNAME, "/"),
+                      cache.comments = TRUE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.path       = paste0("../reports/figures/", DOCNAME, "/"),
+                      fig.width      = 10,
+                      fig.height     = 8,
+                      message        = FALSE,
+                      warning        = FALSE)
+```
+
+# Introduction
+
+Here is what I am going to do...
+
+```{r, message=FALSE}
+library(dplyr)
+library(glue)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+source("../scripts/helpers.R")
+
+# multithreading
+library(future)
+plan()
+
+options(future.globals.maxSize = 1000 * 1024^2)
+plan("multiprocess", workers = 10)
+plan()
+```
+
+# Load dataset
+
+```{r}
+adata <- readRDS('../data/processed/01_adata.RDS')
+```
+
+```{r}
+hto <- Read10X('../data/processed/citeseq-count/umi_count/', gene.column=1)
+hto <- hto[rownames(hto)[1:4], ]
+rownames(hto) <- c('A0259', 'A0260', 'A0262', 'A0263')
+
+glue("# cell tags: {dim(adata)[2]}")
+common_cell_barcodes <- intersect(colnames(adata), colnames(hto))
+adata <- adata[, common_cell_barcodes]
+hto <- as.matrix(hto[, common_cell_barcodes])
+
+glue("# cell tags: {dim(adata)[2]}")
+```
+
+# HTO
+
+## Adding HTO
+
+```{r}
+adata[["HTO"]] <- CreateAssayObject(counts = hto)
+adata <- NormalizeData(adata, assay = "HTO", normalization.method = "CLR")
+```
+
+## HTO demultiplexing
+
+- Doublet: 2 hashtags detected
+- Singlet: 1 hashtag
+- Negative: No hashtag
+
+```{r}
+adata <- HTODemux(adata, assay = "HTO", positive.quantile = 0.99, seed = random_seed)
+```
+
+```{r}
+table(adata$HTO_classification.global)
+```
+
+```{r}
+Idents(adata) <- "HTO_maxID"
+RidgePlot(adata, assay = "HTO", features = rownames(adata[["HTO"]]), ncol = 2)
+```
+
+```{r}
+Idents(adata) <- "HTO_classification.global"
+VlnPlot(adata, features = "nCount_RNA", pt.size = 0.1, log = TRUE)
+```
+
+```{r}
+HTOHeatmap(adata, assay = "HTO", ncells = 5000)
+```
+
+# Re-analysis
+
+## RNA
+
+We are only interested in cells with one hashtag. The rest we ignore.
+
+```{r}
+adata <- subset(adata, idents = "Singlet")
+adata <- FindVariableFeatures(adata)
+adata <- CellCycleScoring(adata, s.features = cc.genes$s.genes, g2m.features = cc.genes$g2m.genes, set.ident = TRUE)
+adata <- ScaleData(adata, vars.to.regress = c("S.Score", "G2M.Score"), features = rownames(adata))
+adata <- RunPCA(adata, features = VariableFeatures(adata))
+
+adata <- FindNeighbors(adata, dims = 1:30)
+adata <- FindClusters(adata, random.seed = random_seed)
+adata <- RunUMAP(adata, dims = 1:30, seed.use = random_seed)
+```
+
+```{r}
+DimPlot(adata, group.by = "HTO_classification")
+DimPlot(adata, group.by = "seurat_clusters")
+```
+
+## HTO
+
+```{r}
+DefaultAssay(adata) <- "HTO"
+adata <- ScaleData(adata, features = rownames(adata))
+```
+
+```{r}
+DimPlot(adata, group.by = "HTO_classification")
+DimPlot(adata, group.by = "seurat_clusters")
+```
+
+# Markers
+
+## RNA
+
+```{r}
+DefaultAssay(adata) <- "RNA"
+adata@misc$annotation <- get_annotation(adata)
+rna_markers <- FindAllMarkers(adata, logfc.threshold = 1, only.pos = TRUE)
+rna_markers <- cbind(rna_markers, adata@misc$annotation[rna_markers$gene, c("ensembl_id", "description")])
+write.csv(rna_markers, file = '../results/02_rna_markers.csv')
+```
+
+## HTO
+
+```{r}
+DefaultAssay(adata) <- "HTO"
+hto_markers <- FindAllMarkers(adata, only.pos = TRUE)
+write.csv(hto_markers, file = '../results/02_hto_markers.csv')
+```
+
+## HTO - based on specific hashtag combinations
+
+- A0262 vs. A0263
+- A2062 vs. A0260
+- A0263 vs. A0260
+- A0260 vs. A0259
+
+```{r}
+DefaultAssay(adata) <- "RNA"
+Idents(adata) <- "HTO_classification"
+
+m_262_263 <- FindMarkers(adata, ident.1 = "A0262", ident.2 = "A0263", only.pos = F) %>% 
+  filter(abs(avg_log2FC) > 0.5 & p_val_adj < 0.05)
+m_262_263 <- cbind(m_262_263, adata@misc$annotation[rownames(m_262_263), c("ensembl_id", "description")])
+
+m_262_260 <- FindMarkers(adata, ident.1 = "A0262", ident.2 = "A0260", only.pos = F) %>%
+  filter(abs(avg_log2FC) > 0.5 & p_val_adj < 0.05)
+m_262_260 <- cbind(m_262_260, adata@misc$annotation[rownames(m_262_260), c("ensembl_id", "description")])
+
+m_263_260 <- FindMarkers(adata, ident.1 = "A0263", ident.2 = "A0260", only.pos = F) %>%
+  filter(abs(avg_log2FC) > 0.5 & p_val_adj < 0.05)
+m_263_260 <- cbind(m_263_260, adata@misc$annotation[rownames(m_263_260), c("ensembl_id", "description")])
+
+m_260_259 <- FindMarkers(adata, ident.1 = "A0260", ident.2 = "A0259", only.pos = F) %>% 
+  filter(abs(avg_log2FC) > 0.5 & p_val_adj < 0.05)
+m_260_259 <- cbind(m_260_259, adata@misc$annotation[rownames(m_260_259), c("ensembl_id", "description")])
+
+write.csv(m_262_263, file = "../results/02_A0262_A0263.csv")
+write.csv(m_262_260, file = "../results/02_A0262_A0260.csv")
+write.csv(m_263_260, file = "../results/02_A0263_A0260.csv")
+write.csv(m_260_259, file = "../results/02_A0260_A0259.csv")
+```
+
+## Save results
+
+```{r}
+saveRDS(adata, file='../data/processed/02_rna_hto.RDS')
+```

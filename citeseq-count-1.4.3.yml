@@ -1,0 +1,10 @@
+name: citeseq-count-1.4.3
+channels:
+  - bioconda
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.7
+  - pip
+  - pip
+    - CITE-seq-Count==1.4.3

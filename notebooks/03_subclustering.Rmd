@@ -1,0 +1,186 @@
+---
+title: "03_subclustering"
+author: "Martin Proks"
+date: '`r Sys.Date()`'
+knit: (function(inputFile, encoding) { 
+      rmarkdown::render(inputFile,
+                        encoding=encoding,
+                        output_format='all',
+                        output_dir='../reports/')})
+output:
+  # To create PDF report, uncomment below
+  #pdf_document:
+  #  toc: yes
+  html_document:
+    number_sections: yes
+    theme: yeti
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    dev: png
+---
+
+```{r knitr, include = FALSE}
+DOCNAME = knitr::current_input()
+knitr::opts_chunk$set(autodep        = TRUE,
+                      cache          = FALSE,
+                      cache.path     = paste0("cache/", DOCNAME, "/"),
+                      cache.comments = TRUE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.path       = paste0("../reports/figures/", DOCNAME, "/"),
+                      fig.width      = 10,
+                      fig.height     = 8,
+                      message        = FALSE,
+                      warning        = FALSE)
+```
+
+# Introduction
+
+Subcluster the left part of UMAP and identify markers.
+
+```{r}
+library(dplyr)
+library(glue)
+library(Seurat)
+library(patchwork)
+library(ggplot2)
+source("../scripts/helpers.R")
+
+# multithreading
+library(future)
+plan()
+
+options(future.globals.maxSize = 1000 * 1024^2)
+plan("multiprocess", workers = 10)
+plan()
+
+options(bitmapType='cairo')
+```
+
+# Subset
+
+```{r}
+adata <- readRDS("../data/processed/02_rna_hto.RDS")
+DefaultAssay(adata) <- "RNA"
+Idents(adata) <- "seurat_clusters"
+```
+
+```{r}
+# selected_cells <- CellSelector(DimPlot(adata))
+# write.csv(selected_cells, file = "../results/03_subset_cells.csv")
+selected_cells <- read.csv("../results/03_subset_cells.csv")$x
+adata_sub = adata[, selected_cells]
+
+DimPlot(adata_sub)
+```
+
+# Subcluster
+
+```{r}
+adata_sub <- FindNeighbors(adata_sub, dims = 1:30)
+adata_sub <- FindClusters(adata_sub, resolution = 1, random.seed = random_seed)
+```
+
+```{r}
+DimPlot(adata_sub)
+```
+
+```{r}
+saveRDS(adata_sub, file = '../data/processed/03_subcluster.RDS')
+```
+
+```{r}
+library(SeuratDisk)
+
+adata_sub@assays$RNA@scale.data <- matrix()
+SaveH5Seurat(adata_sub, filename = "../data/processed/03_subcluster.h5Seurat", overwrite = T)
+Convert("../data/processed/03_subcluster.h5Seurat", dest = "h5ad", overwrite = T)
+```
+
+# Markers
+
+## RNA
+
+```{r}
+DefaultAssay(adata_sub) <- "RNA"
+rna_markers <- FindAllMarkers(adata_sub, logfc.threshold = 1, only.pos = TRUE)
+rna_markers <- cbind(rna_markers, adata_sub@misc$annotation[rna_markers$gene, c("ensembl_id", "description")])
+write.csv(rna_markers, file = '../results/03_rna_markers.csv')
+```
+
+## HTO
+
+```{r}
+DefaultAssay(adata_sub) <- "HTO"
+hto_markers <- FindAllMarkers(adata_sub, only.pos = TRUE)
+write.csv(hto_markers, file = '../results/03_hto_markers.csv')
+```
+
+## HTO - based on specific hashtag combinations
+
+- A0262 vs. A0263
+- A2062 vs. A0260
+- A0263 vs. A0260
+- A0260 vs. A0259
+
+```{r}
+DefaultAssay(adata_sub) <- "RNA"
+Idents(adata_sub) <- "HTO_classification"
+
+m_262_263 <- FindMarkers(adata_sub, ident.1 = "A0262", ident.2 = "A0263", only.pos = F) %>% 
+  filter(abs(avg_log2FC) > 0.5 & p_val_adj < 0.05)
+m_262_263 <- cbind(m_262_263, adata_sub@misc$annotation[rownames(m_262_263), c("ensembl_id", "description")])
+
+m_262_260 <- FindMarkers(adata_sub, ident.1 = "A0262", ident.2 = "A0260", only.pos = F) %>%
+  filter(abs(avg_log2FC) > 0.5 & p_val_adj < 0.05)
+m_262_260 <- cbind(m_262_260, adata_sub@misc$annotation[rownames(m_262_260), c("ensembl_id", "description")])
+
+m_263_260 <- FindMarkers(adata_sub, ident.1 = "A0263", ident.2 = "A0260", only.pos = F) %>%
+  filter(abs(avg_log2FC) > 0.5 & p_val_adj < 0.05)
+m_263_260 <- cbind(m_263_260, adata_sub@misc$annotation[rownames(m_263_260), c("ensembl_id", "description")])
+
+m_260_259 <- FindMarkers(adata_sub, ident.1 = "A0260", ident.2 = "A0259", only.pos = F) %>% 
+  filter(abs(avg_log2FC) > 0.5 & p_val_adj < 0.05)
+m_260_259 <- cbind(m_260_259, adata_sub@misc$annotation[rownames(m_260_259), c("ensembl_id", "description")])
+
+write.csv(m_262_263, file = "../results/03_A0262_A0263.csv")
+write.csv(m_262_260, file = "../results/03_A0262_A0260.csv")
+write.csv(m_263_260, file = "../results/03_A0263_A0260.csv")
+write.csv(m_260_259, file = "../results/03_A0260_A0259.csv")
+```
+
+## Per louvain and HTO
+
+We identify markers by grouping cells based on predefined clustering using louvain.
+For each cluster we ask what are the markers in that cluster based on HTO.
+Markers generated below are only specific for particular louvain cluster per HTO hashtag.
+
+```{r}
+markers <- NULL
+for (cluster in unique(adata_sub$seurat_clusters)) {
+  for (hashtag in unique(adata_sub$HTO_classification)) {
+    m <- NULL
+    tryCatch({
+      m <- FindMarkers(adata_sub[, adata_sub$seurat_clusters == cluster], 
+                       ident.1 = hashtag, group.by = 'HTO_classification', verbose = F)
+      m <- m %>% filter(p_val_adj < 0.05 & abs(avg_log2FC) > 1)
+      m$cluster <- cluster
+      m$hashtag <- hashtag
+      m$combined <- glue('{cluster}_{hashtag}')
+      markers <- rbind(markers, m)
+    }, error = function(error_condition) {
+        print(glue('Skipping {hashtag} for cluster #{cluster}'))
+    })
+  }
+}
+markers <- cbind(markers, adata_sub@misc$annotation[rownames(markers), c("ensembl_id", "description")])
+write.csv(markers, '../results/03_rna_per_hto_markers.csv')
+```
+
+# Session info
+
+```{r session-info, cache = FALSE}
+devtools::session_info()
+```

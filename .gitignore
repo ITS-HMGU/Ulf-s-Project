@@ -1,0 +1,9 @@
+.DS_Store
+data/
+results/
+reports/
+documents/
+meetings.md
+.ipynb_checkpoints
+scripts/.gitkeep
+notebooks/.gitkeep

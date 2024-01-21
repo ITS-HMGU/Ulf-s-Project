@@ -1,0 +1,62 @@
+---
+title: "04 - Convert Seurat to anndata"
+author: "Martin Proks"
+date: '`r Sys.Date()`'
+knit: (function(inputFile, encoding) { 
+      rmarkdown::render(inputFile,
+                        encoding=encoding,
+                        output_format='all',
+                        output_dir='../reports/')})
+output:
+  # To create PDF report, uncomment below
+  #pdf_document:
+  #  toc: yes
+  html_document:
+    number_sections: yes
+    theme: yeti
+    toc: yes
+    toc_float: yes
+    df_print: paged
+    dev: png
+---
+
+```{r knitr, include = FALSE}
+DOCNAME = knitr::current_input()
+knitr::opts_chunk$set(autodep        = TRUE,
+                      cache          = FALSE,
+                      cache.path     = paste0("cache/", DOCNAME, "/"),
+                      cache.comments = TRUE,
+                      echo           = TRUE,
+                      error          = FALSE,
+                      fig.align      = "center",
+                      fig.path       = paste0("../reports/figures/", DOCNAME, "/"),
+                      fig.width      = 10,
+                      fig.height     = 8,
+                      message        = FALSE,
+                      warning        = FALSE)
+```
+
+# Introduction
+
+Convert Seurat objects into anndata so we can run `scvelo`.
+
+```{r}
+library(Seurat)
+library(SeuratDisk)
+# library(SeuratWrappers)
+```
+
+```{r}
+adata <- readRDS('../data/processed/01_adata.RDS')
+adata@assays$RNA@data <- adata@assays$RNA@counts
+SaveH5Seurat(adata, filename = "../data/processed/01_adata.h5Seurat")
+Convert("../data/processed/01_adata.h5Seurat", dest = "h5ad")
+```
+
+```{r}
+adata <- readRDS('../data/processed/02_rna_hto.RDS')
+# adata@assays$RNA@data <- adata@assays$RNA@counts
+SaveH5Seurat(adata, filename = "../data/processed/02_rna_hto.h5Seurat")
+Convert("../data/processed/02_rna_hto.h5Seurat", dest = "h5ad")
+```
+
